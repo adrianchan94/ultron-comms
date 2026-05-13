@@ -38,6 +38,8 @@ interface BridgeConfig {
   lettaAgentId: string;
   maxAttempts: number;
   timeoutMs: number;
+  pinnedConversationId: string;
+  conversationSummary: string;
 }
 
 interface LettaResponse {
@@ -53,6 +55,18 @@ interface ConversationState {
 const DEFAULT_KEV_AGENT_ID = "agent-71b0883e-c63f-4e79-bab4-a45a1380bd60";
 const DEFAULT_PEER_ID = "KX7onZR1";
 const DEFAULT_CONVERSATION_SUMMARY = "MESH — ULTRON ↔ Kev Fast Lane";
+
+// Module-scoped logger so helpers like ensureConversation() can use the same
+// timestamped prefix runKevBridge() uses.
+function log(msg: string): void {
+  // eslint-disable-next-line no-console
+  console.log(`[kev-bridge] ${new Date().toISOString()} ${msg}`);
+}
+
+// Stable channel pin: when set, the bridge always uses this exact conversation
+// id and refuses to silently rotate to a new thread (every container restart
+// otherwise created a new "MESH — ULTRON ↔ Kev Fast Lane" entry in Kev's
+// Letta sidebar, which is the symptom Adrian flagged on 2026-05-14).
 
 function readConfig(): BridgeConfig {
   const lettaKey = process.env.LETTA_API_KEY ?? "";
@@ -73,6 +87,8 @@ function readConfig(): BridgeConfig {
     lettaAgentId: orDefault(process.env.LETTA_AGENT_ID, DEFAULT_KEV_AGENT_ID),
     maxAttempts: Math.max(1, Number(orDefault(process.env.KEV_BRIDGE_MAX_ATTEMPTS, "6"))),
     timeoutMs: Math.max(1000, Number(orDefault(process.env.KEV_BRIDGE_TIMEOUT_MS, "180000"))),
+    pinnedConversationId: orDefault(process.env.LETTA_CONVERSATION_ID, ""),
+    conversationSummary: orDefault(process.env.LETTA_CONVERSATION_SUMMARY, DEFAULT_CONVERSATION_SUMMARY),
   };
 }
 
@@ -111,6 +127,12 @@ async function ensureConversation(
   cfg: BridgeConfig,
   state: ConversationState,
 ): Promise<ConversationState> {
+  // 1. Adopt pinned conversation id from env on first call after restart.
+  //    Subsequent calls will hit the state.id branch below.
+  if (!state.id && cfg.pinnedConversationId) {
+    state.id = cfg.pinnedConversationId;
+  }
+
   if (state.id) {
     const r = await lettaRequest(cfg, "GET", `/v1/conversations/${state.id}`, null, 15000);
     if (r.status >= 200 && r.status < 300) {
@@ -119,16 +141,54 @@ async function ensureConversation(
         if (data.agent_id === cfg.lettaAgentId) return state;
       } catch { /* fall through */ }
     }
+    log(`pinned/cached conversation id=${state.id} stale (status=${r.status}) — falling back to discover`);
     delete state.id;
   }
-  // Letta now requires agent_id as a query parameter (server returns 422
-  // with detail loc=("query","agent_id") if absent from the URL). Keep
-  // it in the body too for forward-compat.
+
+  // 2. Try to discover an existing conversation matching our summary so we
+  //    reuse the same thread across container restarts. This keeps Kev's
+  //    Letta sidebar from accumulating duplicate "MESH — ULTRON ↔ Kev Fast
+  //    Lane" entries every time the bridge restarts.
+  const list = await lettaRequest(
+    cfg,
+    "GET",
+    `/v1/conversations/?agent_id=${encodeURIComponent(cfg.lettaAgentId)}&limit=50`,
+    null,
+    15000,
+  );
+  if (list.status >= 200 && list.status < 300) {
+    try {
+      const parsed = JSON.parse(list.body) as unknown;
+      const arr = Array.isArray(parsed)
+        ? parsed
+        : (parsed as { data?: unknown[]; conversations?: unknown[] }).data
+          ?? (parsed as { conversations?: unknown[] }).conversations
+          ?? [];
+      const matches = (arr as Array<{ id?: string; summary?: string; created_at?: string; updated_at?: string }>)
+        .filter((c) => typeof c.id === "string" && c.summary === cfg.conversationSummary)
+        .sort((a, b) => {
+          const ta = Date.parse(a.updated_at ?? a.created_at ?? "") || 0;
+          const tb = Date.parse(b.updated_at ?? b.created_at ?? "") || 0;
+          return tb - ta;
+        });
+      const first = matches[0];
+      if (first && first.id) {
+        state.id = first.id;
+        state.summary = first.summary ?? cfg.conversationSummary;
+        log(`reusing existing conversation id=${state.id} (${matches.length} match(es) found)`);
+        return state;
+      }
+    } catch (err) {
+      log(`conversation discovery parse failed: ${(err as Error).message}`);
+    }
+  }
+
+  // 3. Nothing reusable — create fresh.
   const create = await lettaRequest(
     cfg,
     "POST",
     `/v1/conversations/?agent_id=${encodeURIComponent(cfg.lettaAgentId)}`,
-    { agent_id: cfg.lettaAgentId, summary: state.summary },
+    { agent_id: cfg.lettaAgentId, summary: cfg.conversationSummary },
     20000,
   );
   if (create.status < 200 || create.status >= 300) {
@@ -136,7 +196,8 @@ async function ensureConversation(
   }
   const data = JSON.parse(create.body) as { id: string; summary?: string };
   state.id = data.id;
-  state.summary = data.summary ?? state.summary;
+  state.summary = data.summary ?? cfg.conversationSummary;
+  log(`created new conversation id=${state.id}`);
   return state;
 }
 
@@ -206,10 +267,7 @@ async function askKev(
 
 export async function runKevBridge(): Promise<void> {
   const cfg = readConfig();
-  const log = (msg: string): void => {
-    // eslint-disable-next-line no-console
-    console.log(`[kev-bridge] ${new Date().toISOString()} ${msg}`);
-  };
+  // log() is now module-scoped — see top of file.
   log(`starting peerId=${cfg.peerId} letta=${cfg.lettaUrl} agent=${cfg.lettaAgentId.slice(0, 20)}…`);
 
   const store = new MeshStore();
