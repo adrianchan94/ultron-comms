@@ -232,7 +232,10 @@ export async function runKevBridge() {
             cwd: process.cwd(),
         }).catch(() => { });
     }, 60_000);
-    reregisterTimer.unref?.();
+    // Intentionally NOT calling reregisterTimer.unref() — we WANT this timer
+    // to keep the event loop alive. Without it, the container exits seconds
+    // after init because the WS socket alone isn't enough to keep Node ticking.
+    void reregisterTimer;
     // Keep the process alive forever.
     const stop = async (sig) => {
         log(`signal ${sig} — shutting down`);
@@ -245,5 +248,9 @@ export async function runKevBridge() {
     process.on("SIGTERM", () => void stop("SIGTERM"));
     process.on("SIGINT", () => void stop("SIGINT"));
     log(`bridge running — DMs to peerId=${cfg.peerId} forward to Letta`);
+    // Belt + suspenders heartbeat — explicit ref'd interval. The container
+    // entrypoint treats clean exit as success and the orchestrator would
+    // restart-loop forever otherwise.
+    setInterval(() => { }, 30_000);
 }
 //# sourceMappingURL=bridge.js.map
