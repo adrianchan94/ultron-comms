@@ -5,8 +5,13 @@ FROM node:24-alpine AS builder
 WORKDIR /app
 RUN apk add --no-cache git
 COPY package.json package-lock.json* ./
-# Skip husky/prepare in build container — no .git hooks needed.
-RUN npm pkg delete scripts.prepare && npm install --no-audit --no-fund
+# Drop husky/prepare AND the postinstall tsc fallback. The latter would
+# otherwise run during npm install (when dist/ isn't yet in the build
+# context) and fail because typescript isn't installed yet. We run tsc
+# explicitly after COPY src ./src below.
+RUN npm pkg delete scripts.prepare && \
+    npm pkg delete scripts.postinstall && \
+    npm install --no-audit --no-fund
 # eslint.config.ts is intentionally excluded by .dockerignore (lint runs in CI,
 # not in the image build). Only the tsc inputs are copied here.
 COPY tsconfig.json ./
