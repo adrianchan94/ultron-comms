@@ -75,7 +75,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.28.0",
-    "typebox": "1.1.28",
+    "typebox": "1.1.38",
     "ws": "8.20.0",
     "zod": "4.3.6"
   },
