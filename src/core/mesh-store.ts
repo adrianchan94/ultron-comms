@@ -10,6 +10,13 @@
  */
 
 import * as net from "node:net";
+import {
+  type Wire,
+  type WireServer,
+  createWireServer,
+  createWireConnection,
+  TRANSPORT,
+} from "./transport.js";
 import { nanoid } from "./nanoid.js";
 import { CommsError } from "./store.js";
 import type { CommsStore } from "./comms-store.js";
@@ -137,13 +144,11 @@ function dmKey(a: string, b: string): string {
 // Async socket write
 // ---------------------------------------------------------------------------
 
-function writeAsync(socket: net.Socket, data: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    socket.write(data, "utf-8", (err) => {
-      if (err) reject(err);
-      else resolve();
-    });
-  });
+function writeAsync(socket: Wire, data: string): Promise<void> {
+  // Wire transports (TCP + WS) are fire-and-forget: messages are small JSON
+  // envelopes so backpressure is not a real concern. Return immediately.
+  socket.write(data);
+  return Promise.resolve();
 }
 
 // ---------------------------------------------------------------------------
@@ -162,20 +167,20 @@ export class MeshStore implements CommsStore {
   private deliveryQueues = new Map<string, DeliveryEvent[]>();
   private identityCache = new Map<string, { id: string }>();
 
-  private dataServer: net.Server | undefined;
+  private dataServer: WireServer | undefined;
   private dataPort = 0;
-  private coordinatorServer: net.Server | undefined;
+  private coordinatorServer: WireServer | undefined;
   private isCoordinator = false;
   private peerConnections = new Map<
     string,
-    { socket: net.Socket; buffer: MessageBuffer }
+    { socket: Wire; buffer: MessageBuffer }
   >();
   /** All sockets accepted by the data server — destroyed on shutdown. */
-  private dataServerSockets = new Set<net.Socket>();
+  private dataServerSockets = new Set<Wire>();
   /** All sockets accepted by the coordinator server — destroyed on shutdown. */
-  private coordinatorServerSockets = new Set<net.Socket>();
+  private coordinatorServerSockets = new Set<Wire>();
   /** Socket connected to the coordinator (client side) — destroyed on shutdown. */
-  private coordinatorSocket: net.Socket | undefined;
+  private coordinatorSocket: Wire | undefined;
   private peerInfo = new Map<string, PeerInfo>();
   private staleCheckTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -199,16 +204,18 @@ export class MeshStore implements CommsStore {
     // Unref all root handles so the event loop can exit when pi shuts down.
     // Sockets/servers still function normally for I/O but don't keep the
     // process alive. shutdown() will destroy them explicitly.
-    this.dataServer?.unref();
-    this.coordinatorServer?.unref();
-    this.coordinatorSocket?.unref();
+    this.dataServer?.unref?.();
+    this.coordinatorServer?.unref?.();
+    this.coordinatorSocket?.unref?.();
   }
 
   private startDataServer(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.dataServer = net.createServer((socket) => {
+      this.dataServer = createWireServer((socket) => {
         this.handleDataConnection(socket);
       });
+      // Port 0 = ephemeral. WS transport: we still want a free port; the
+      // http server will pick one.
       this.dataServer.listen(0, COORDINATOR_BIND_HOST, () => {
         const addr = this.dataServer?.address();
         if (addr && typeof addr === "object") {
@@ -223,14 +230,21 @@ export class MeshStore implements CommsStore {
   private async tryJoinMesh(): Promise<void> {
     try {
       await this.connectToCoordinator();
-    } catch {
+    } catch (err) {
+      // Auth-rejected clients must NOT fall through to becomeCoordinator:
+      // (a) on a remote coordinator they cannot bind the port anyway, and
+      // (b) silently "becoming the coordinator" with a wrong key would
+      //     surface as a confusing isCoordinator=true instead of an error.
+      if ((err as { authFailed?: boolean })?.authFailed) {
+        throw err;
+      }
       await this.becomeCoordinator();
     }
   }
 
   private connectToCoordinator(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const socket = net.createConnection(
+      const socket = createWireConnection(
         { port: this.coordinatorPort, host: COORDINATOR_HOST },
         () => {
           this.coordinatorSocket = socket;
@@ -257,6 +271,12 @@ export class MeshStore implements CommsStore {
                   acked = true;
                   clearTimeout(timer);
                   resolve();
+                } else if ((item as { method?: string }).method === "auth_failed") {
+                  // Server explicitly rejected our auth token. Surface a
+                  // distinct error so tryJoinMesh skips becomeCoordinator.
+                  clearTimeout(timer);
+                  socket.destroy();
+                  reject(Object.assign(new Error("auth_failed"), { authFailed: true }));
                 }
               }
             }
@@ -294,7 +314,7 @@ export class MeshStore implements CommsStore {
 
   private becomeCoordinator(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.coordinatorServer = net.createServer((socket) => {
+      this.coordinatorServer = createWireServer((socket) => {
         this.handleCoordinatorConnection(socket);
       });
 
@@ -330,7 +350,7 @@ export class MeshStore implements CommsStore {
   // Coordinator protocol
   // -----------------------------------------------------------------------
 
-  private handleCoordinatorConnection(socket: net.Socket): void {
+  private handleCoordinatorConnection(socket: Wire): void {
     this.coordinatorServerSockets.add(socket);
     socket.on("close", () => this.coordinatorServerSockets.delete(socket));
     socket.on("error", () => { /* drop noisy peer disconnect / RST */ });
@@ -343,6 +363,7 @@ export class MeshStore implements CommsStore {
           if (!authValid((item as { authToken?: unknown }).authToken)) {
             // eslint-disable-next-line no-console
             console.warn(`[ultron-comms] auth_rejected peer=${(item as { peerId?: string }).peerId ?? "?"} from coordinator handshake`);
+            try { socket.write(encode({ method: "auth_failed", reason: "bad token" } as unknown as MeshMessage)); } catch { /* ignore */ }
             try { socket.destroy(); } catch { /* ignore */ }
             return;
           }
@@ -353,7 +374,7 @@ export class MeshStore implements CommsStore {
   }
 
   private async handleIntroduction(
-    socket: net.Socket,
+    socket: Wire,
     msg: { method: "introduce"; peerId: string; dataPort: number; authToken?: string },
   ): Promise<void> {
     const newPeer: PeerInfo = {
@@ -382,7 +403,7 @@ export class MeshStore implements CommsStore {
   // Data connections
   // -----------------------------------------------------------------------
 
-  private handleDataConnection(socket: net.Socket): void {
+  private handleDataConnection(socket: Wire): void {
     this.dataServerSockets.add(socket);
     socket.on("close", () => this.dataServerSockets.delete(socket));
     socket.on("error", () => { /* drop noisy peer disconnect / RST */ });
@@ -404,6 +425,7 @@ export class MeshStore implements CommsStore {
             remotePeerId = item.peerId;
           }
           void this.handleDataMessage(item);
+        }
       }
       if (remotePeerId && !this.peerConnections.has(remotePeerId)) {
         this.peerConnections.set(remotePeerId, { socket, buffer });
@@ -506,7 +528,7 @@ export class MeshStore implements CommsStore {
     if (this.peerConnections.has(peer.id)) return;
 
     return new Promise((resolve) => {
-      const socket = net.createConnection(
+      const socket = createWireConnection(
         { port: peer.port, host: COORDINATOR_HOST },
         () => {
           const buf = new MessageBuffer();
@@ -1273,11 +1295,11 @@ export class MeshStore implements CommsStore {
     // Always clean up coordinator state, even with no successor
     this.stopStaleCheck();
     for (const socket of this.coordinatorServerSockets) {
-      socket.unref();
+      socket.unref?.();
       socket.destroy();
     }
     this.coordinatorServerSockets.clear();
-    this.coordinatorServer?.unref();
+    this.coordinatorServer?.unref?.();
     this.coordinatorServer?.close();
     this.coordinatorServer = undefined;
     this.isCoordinator = false;
@@ -1300,27 +1322,27 @@ export class MeshStore implements CommsStore {
     await this.handoverCoordinator();
 
     // Destroy the coordinator client socket (not tracked in peerConnections)
-    this.coordinatorSocket?.unref();
+    this.coordinatorSocket?.unref?.();
     this.coordinatorSocket?.destroy();
     this.coordinatorSocket = undefined;
 
     // Destroy all identified peer connections
     for (const [, peer] of this.peerConnections) {
-      peer.socket.unref();
+      peer.socket.unref?.();
       peer.socket.destroy();
     }
     this.peerConnections.clear();
 
     // Destroy all data server accepted sockets (including unidentified)
     for (const socket of this.dataServerSockets) {
-      socket.unref();
+      socket.unref?.();
       socket.destroy();
     }
     this.dataServerSockets.clear();
 
     // Destroy all coordinator server accepted sockets
     for (const socket of this.coordinatorServerSockets) {
-      socket.unref();
+      socket.unref?.();
       socket.destroy();
     }
     this.coordinatorServerSockets.clear();
@@ -1328,10 +1350,10 @@ export class MeshStore implements CommsStore {
     this.stopStaleCheck();
 
     // Close servers — stop accepting new connections
-    this.dataServer?.unref();
+    this.dataServer?.unref?.();
     this.dataServer?.close();
     this.dataServer = undefined;
-    this.coordinatorServer?.unref();
+    this.coordinatorServer?.unref?.();
     this.coordinatorServer?.close();
     this.coordinatorServer = undefined;
   }
