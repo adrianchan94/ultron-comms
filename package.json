@@ -1,15 +1,15 @@
 {
-  "name": "agent-comms",
-  "version": "1.8.0",
-  "description": "Cross-harness communication mesh for LLM agents — rooms, DMs, presence, and real-time push delivery over TCP",
+  "name": "ultron-comms",
+  "version": "2.0.0",
+  "description": "ULTRON cross-machine agent mesh — env-driven coordinator host + shared-secret auth. Fork of agent-comms@1.8.0.",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ExaDev/agent-comms.git"
+    "url": "git+https://github.com/adrianchan/ultron-comms.git"
   },
-  "homepage": "https://github.com/ExaDev/agent-comms#readme",
-  "bugs": "https://github.com/ExaDev/agent-comms/issues",
+  "homepage": "https://github.com/adrianchan/ultron-comms#readme",
+  "bugs": "https://github.com/adrianchan/ultron-comms/issues",
   "license": "MIT",
   "keywords": [
     "agent",
@@ -36,7 +36,7 @@
     ".claude-plugin/"
   ],
   "bin": {
-    "agent-comms": "dist/cli.js"
+    "ultron-comms": "dist/cli.js"
   },
   "publishConfig": {
     "provenance": true,

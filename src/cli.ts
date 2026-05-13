@@ -25,6 +25,7 @@ import * as os from "node:os";
 import { execSync } from "node:child_process";
 import { z } from "zod";
 import { bridges } from "./bridges/index.js";
+import { MeshStore } from "./core/mesh-store.js";
 import { runTui } from "./bridges/user/tui.js";
 import { runCli } from "./bridges/user/cli.js";
 
@@ -178,6 +179,54 @@ const harnesses: HarnessDef[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Coordinator (cloud server) mode
+// ---------------------------------------------------------------------------
+
+function runCoordinator(): void {
+  const port = Number.parseInt(process.env.ULTRON_COMMS_PORT ?? "19876", 10);
+  const bindHost = process.env.ULTRON_COMMS_BIND ?? "0.0.0.0";
+  const authSet = !!process.env.ULTRON_COMMS_KEY;
+  // eslint-disable-next-line no-console
+  console.log(`[ultron-comms] coordinator starting host=${bindHost}:${port} auth=${authSet ? "required" : "disabled"}`);
+  if (!authSet) {
+    // eslint-disable-next-line no-console
+    console.warn("[ultron-comms] WARNING: ULTRON_COMMS_KEY not set \u2014 coordinator is OPEN. Set ULTRON_COMMS_KEY before exposing publicly.");
+  }
+  const store = new MeshStore(port);
+  store
+    .init()
+    .then(() => {
+      // eslint-disable-next-line no-console
+      console.log(`[ultron-comms] coordinator ready peerId=${store.peerId} coordinator=${store.coordinatorPort} isCoordinator=${(store as unknown as { isCoordinator?: boolean }).isCoordinator}`);
+    })
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error(`[ultron-comms] coordinator init failed: ${err?.message ?? err}`);
+      process.exit(1);
+    });
+  // Health endpoint on a sibling HTTP port (Northflank healthcheck)
+  const healthPort = Number.parseInt(process.env.ULTRON_COMMS_HEALTH_PORT ?? "8080", 10);
+  import("node:http").then(({ createServer }) => {
+    createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, peerId: store.peerId, port }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    }).listen(healthPort, bindHost, () => {
+      // eslint-disable-next-line no-console
+      console.log(`[ultron-comms] health server on ${bindHost}:${healthPort}/health`);
+    });
+  });
+  process.on("SIGTERM", () => { void store.shutdown().then(() => process.exit(0)); });
+  process.on("SIGINT", () => { void store.shutdown().then(() => process.exit(0)); });
+  // Stay alive
+  setInterval(() => { /* keepalive */ }, 1 << 30);
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -200,6 +249,11 @@ switch (command) {
       process.exit(1);
     }
     runBridge(bridgeId);
+    break;
+  }
+  case "coordinator":
+  case "server": {
+    runCoordinator();
     break;
   }
   case "chat": {

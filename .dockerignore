@@ -1,0 +1,17 @@
+node_modules
+dist
+.git
+.github
+.husky
+.claude-plugin
+.mcp.json
+.tool-versions
+.npmrc
+pnpm-lock.yaml
+eslint.config.ts
+README.md
+CLAUDE.md
+AGENTS.md
+release.config.mjs
+*.log
+.DS_Store

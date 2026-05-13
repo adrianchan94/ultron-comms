@@ -29,8 +29,29 @@ import type {
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_COORDINATOR_PORT = 19876;
-const COORDINATOR_HOST = "127.0.0.1";
+const DEFAULT_COORDINATOR_PORT = Number.parseInt(
+  process.env.ULTRON_COMMS_PORT ?? "19876",
+  10,
+);
+// Env-driven host: "127.0.0.1" (default localhost mesh) or a remote coordinator
+// hostname (ULTRON cross-machine fabric).
+const COORDINATOR_HOST = process.env.ULTRON_COMMS_HOST ?? "127.0.0.1";
+// Bind host for servers. When dialling a remote coordinator we still bind data
+// servers on loopback unless explicitly told to expose them.
+const COORDINATOR_BIND_HOST =
+  process.env.ULTRON_COMMS_BIND ?? (COORDINATOR_HOST === "127.0.0.1" ? "127.0.0.1" : "0.0.0.0");
+// Shared-secret bearer for all coordinator + peer-data handshakes.
+// When unset, no auth is enforced (preserves localhost backward-compat).
+// When set, every introduce/pong message must include matching authToken or
+// the connection is dropped with an auth_rejected log.
+const COORDINATOR_AUTH_TOKEN = process.env.ULTRON_COMMS_KEY ?? "";
+function authRequired(): boolean {
+  return COORDINATOR_AUTH_TOKEN.length > 0;
+}
+function authValid(token: unknown): boolean {
+  if (!authRequired()) return true;
+  return typeof token === "string" && token === COORDINATOR_AUTH_TOKEN;
+}
 
 // ---------------------------------------------------------------------------
 // Wire protocol types
@@ -39,12 +60,12 @@ const COORDINATOR_HOST = "127.0.0.1";
 type MeshMessage =
   | { method: "state_sync"; state: SerialisedState }
   | { method: "state_update"; patch: MeshStatePatch }
-  | { method: "introduce"; peerId: string; dataPort: number }
+  | { method: "introduce"; peerId: string; dataPort: number; authToken?: string }
   | { method: "peer_list"; peers: PeerInfo[] }
   | { method: "peer_joined"; peer: PeerInfo }
   | { method: "peer_left"; peerId: string }
   | { method: "become_coordinator"; peerList: PeerInfo[] }
-  | { method: "pong"; peerId: string };
+  | { method: "pong"; peerId: string; authToken?: string };
 
 interface PeerInfo {
   id: string;
@@ -188,7 +209,7 @@ export class MeshStore implements CommsStore {
       this.dataServer = net.createServer((socket) => {
         this.handleDataConnection(socket);
       });
-      this.dataServer.listen(0, COORDINATOR_HOST, () => {
+      this.dataServer.listen(0, COORDINATOR_BIND_HOST, () => {
         const addr = this.dataServer?.address();
         if (addr && typeof addr === "object") {
           this.dataPort = addr.port;
@@ -217,24 +238,32 @@ export class MeshStore implements CommsStore {
             method: "introduce",
             peerId: this.peerId,
             dataPort: this.dataPort,
+            ...(authRequired() ? { authToken: COORDINATOR_AUTH_TOKEN } : {}),
           };
           socket.write(encode(intro));
 
-          // Read the peer_list response
+          // Read the peer_list response. We only resolve when peer_list
+          // arrives (proves the coordinator accepted our introduce + auth).
+          // Auth-rejected peers get their socket destroyed silently by the
+          // coordinator, so we time out instead of silently being a ghost.
+          let acked = false;
           const buf = new MessageBuffer();
           socket.on("data", (data) => {
             const items = buf.append(data.toString());
             for (const item of items) {
               if (isMeshMessage(item)) {
                 this.handleCoordinatorResponse(item);
+                if (!acked && item.method === "peer_list") {
+                  acked = true;
+                  clearTimeout(timer);
+                  resolve();
+                }
               }
             }
           });
           socket.on("error", () => {
             /* ignore late errors */
           });
-          clearTimeout(timer);
-          resolve();
         },
       );
 
@@ -271,7 +300,7 @@ export class MeshStore implements CommsStore {
 
       this.coordinatorServer.listen(
         this.coordinatorPort,
-        COORDINATOR_HOST,
+        COORDINATOR_BIND_HOST,
         () => {
           this.isCoordinator = true;
           this.startStaleCheck();
@@ -304,12 +333,19 @@ export class MeshStore implements CommsStore {
   private handleCoordinatorConnection(socket: net.Socket): void {
     this.coordinatorServerSockets.add(socket);
     socket.on("close", () => this.coordinatorServerSockets.delete(socket));
+    socket.on("error", () => { /* drop noisy peer disconnect / RST */ });
 
     const buffer = new MessageBuffer();
     socket.on("data", (data) => {
       const items = buffer.append(data.toString());
       for (const item of items) {
         if (isMeshMessage(item) && item.method === "introduce") {
+          if (!authValid((item as { authToken?: unknown }).authToken)) {
+            // eslint-disable-next-line no-console
+            console.warn(`[ultron-comms] auth_rejected peer=${(item as { peerId?: string }).peerId ?? "?"} from coordinator handshake`);
+            try { socket.destroy(); } catch { /* ignore */ }
+            return;
+          }
           void this.handleIntroduction(socket, item);
         }
       }
@@ -318,7 +354,7 @@ export class MeshStore implements CommsStore {
 
   private async handleIntroduction(
     socket: net.Socket,
-    msg: { method: "introduce"; peerId: string; dataPort: number },
+    msg: { method: "introduce"; peerId: string; dataPort: number; authToken?: string },
   ): Promise<void> {
     const newPeer: PeerInfo = {
       id: msg.peerId,
@@ -349,6 +385,7 @@ export class MeshStore implements CommsStore {
   private handleDataConnection(socket: net.Socket): void {
     this.dataServerSockets.add(socket);
     socket.on("close", () => this.dataServerSockets.delete(socket));
+    socket.on("error", () => { /* drop noisy peer disconnect / RST */ });
 
     const buffer = new MessageBuffer();
     let remotePeerId: string | undefined;
@@ -357,11 +394,16 @@ export class MeshStore implements CommsStore {
       const items = buffer.append(data.toString());
       for (const item of items) {
         if (isMeshMessage(item)) {
-          void this.handleDataMessage(item);
           if (item.method === "pong") {
+            if (!authValid((item as { authToken?: unknown }).authToken)) {
+              // eslint-disable-next-line no-console
+              console.warn(`[ultron-comms] auth_rejected peer=${item.peerId} from data handshake`);
+              try { socket.destroy(); } catch { /* ignore */ }
+              return;
+            }
             remotePeerId = item.peerId;
           }
-        }
+          void this.handleDataMessage(item);
       }
       if (remotePeerId && !this.peerConnections.has(remotePeerId)) {
         this.peerConnections.set(remotePeerId, { socket, buffer });
@@ -471,7 +513,11 @@ export class MeshStore implements CommsStore {
           this.peerConnections.set(peer.id, { socket, buffer: buf });
 
           // Identify ourselves
-          const pong: MeshMessage = { method: "pong", peerId: this.peerId };
+          const pong: MeshMessage = {
+            method: "pong",
+            peerId: this.peerId,
+            ...(authRequired() ? { authToken: COORDINATOR_AUTH_TOKEN } : {}),
+          };
           socket.write(encode(pong));
 
           // If we have state and peer doesn't, send state sync
