@@ -256,6 +256,19 @@ switch (command) {
     runCoordinator();
     break;
   }
+  case "kev-bridge": {
+    // Cloud-resident Kev presence — connects to a coordinator as Kev's
+    // stable peer and forwards inbound DMs to Letta Cloud. See
+    // src/bridges/kev/bridge.ts for env contract.
+    void import("./bridges/kev/bridge.js").then(({ runKevBridge }) => {
+      void runKevBridge().catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error(`[kev-bridge] fatal: ${(err as Error)?.message ?? err}`);
+        process.exit(1);
+      });
+    });
+    break;
+  }
   case "chat": {
     const chatArgs = process.argv.slice(3);
     runChat(chatArgs);
