@@ -7,7 +7,9 @@ RUN apk add --no-cache git
 COPY package.json package-lock.json* ./
 # Skip husky/prepare in build container — no .git hooks needed.
 RUN npm pkg delete scripts.prepare && npm install --no-audit --no-fund
-COPY tsconfig.json eslint.config.ts ./
+# eslint.config.ts is intentionally excluded by .dockerignore (lint runs in CI,
+# not in the image build). Only the tsc inputs are copied here.
+COPY tsconfig.json ./
 COPY src ./src
 RUN npx tsc && \
     printf '#!/usr/bin/env node\n' | cat - dist/cli.js > dist/cli.tmp && \
