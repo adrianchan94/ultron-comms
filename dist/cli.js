@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * agent-comms — cross-harness LLM agent communication mesh.
  *
