@@ -68,6 +68,13 @@ class WsWire {
 class WsServerAdapter {
     httpServer;
     wss;
+    pingTimer;
+    /**
+     * Per-socket liveness flag flipped by pong handlers. Sockets that miss two
+     * consecutive pings (no pong in ~50 s) get terminated so the coordinator's
+     * peer book doesn't accumulate ghost connections behind a flapping NF edge.
+     */
+    alive = new WeakMap();
     constructor(onConnection) {
         this.httpServer = http.createServer((req, res) => {
             // Embedded health endpoint — single Northflank port for both
@@ -81,8 +88,33 @@ class WsServerAdapter {
         });
         this.wss = new WebSocketServer({ server: this.httpServer });
         this.wss.on("connection", (ws) => {
+            this.alive.set(ws, true);
+            ws.on("pong", () => this.alive.set(ws, true));
             onConnection(new WsWire(ws));
         });
+        // Heartbeat: ping every 25 s so the Northflank/Cloudflare-style edge
+        // doesn't kill idle WS connections at 60 s. ws-level ping is enough to
+        // count as traffic on the TCP layer, AND lets us detect dead peers
+        // that stopped responding (terminate them so reconnect logic fires).
+        this.pingTimer = setInterval(() => {
+            for (const client of this.wss.clients) {
+                const ws = client;
+                if (this.alive.get(ws) === false) {
+                    try {
+                        ws.terminate();
+                    }
+                    catch { /* ignore */ }
+                    continue;
+                }
+                this.alive.set(ws, false);
+                try {
+                    ws.ping();
+                }
+                catch { /* ignore */ }
+            }
+        }, 25_000);
+        // Heartbeat is supervisory — don't keep the loop alive on its own.
+        this.pingTimer.unref?.();
         // Note: we intentionally do NOT re-emit wss errors onto httpServer.
         // ws.Server's WebSocketServer attaches itself to the http server and
         // already proxies httpServer errors to its own listeners, so any extra
@@ -104,6 +136,12 @@ class WsServerAdapter {
         return this;
     }
     close(cb) {
+        try {
+            clearInterval(this.pingTimer);
+        }
+        catch {
+            /* ignore */
+        }
         try {
             this.wss.close();
         }
