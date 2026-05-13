@@ -18,7 +18,12 @@ FROM node:24-alpine AS runtime
 WORKDIR /app
 # Production deps only — coordinator path uses node:net and the bundled core.
 COPY package.json package-lock.json* ./
+# Strip prepare (husky) AND postinstall (tsc fallback) — the multi-stage
+# build already produces dist/ in the builder stage; the runtime image must
+# not try to compile typescript again or it fails because typescript is a
+# devDependency that --omit=dev skips.
 RUN npm pkg delete scripts.prepare && \
+    npm pkg delete scripts.postinstall && \
     npm install --omit=dev --no-audit --no-fund && \
     npm cache clean --force
 COPY --from=builder /app/dist ./dist
