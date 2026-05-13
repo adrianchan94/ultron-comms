@@ -1,0 +1,1 @@
+{"version":3,"file":"index.js","sourceRoot":"","sources":["../../src/bridges/index.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,UAAU,MAAM,0BAA0B,CAAC;AACvD,OAAO,KAAK,KAAK,MAAM,iBAAiB,CAAC;AACzC,OAAO,KAAK,GAAG,MAAM,gBAAgB,CAAC;AAMtC,MAAM,CAAC,MAAM,OAAO,GAA2B;IAC7C,aAAa,EAAE,UAAU;IACzB,KAAK;IACL,GAAG;CACJ,CAAC"}

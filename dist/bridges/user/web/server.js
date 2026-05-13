@@ -1,0 +1,312 @@
+/**
+ * Web UI server — HTTP + WebSocket for browser-based chat.
+ *
+ * Serves a single-page frontend and exposes a JSON API over HTTP
+ * with real-time delivery events over WebSocket.
+ *
+ * REST endpoints:
+ *   GET  /           → frontend HTML
+ *   GET  /api/agents → list agents
+ *   GET  /api/rooms  → list rooms
+ *   GET  /api/rooms/:id/messages → read room messages
+ *   POST /api/action → execute any CommsAction
+ *
+ * WebSocket:
+ *   Server pushes delivery events as JSON frames.
+ *   Client sends action objects.
+ */
+import * as http from "node:http";
+import { WebSocketServer } from "ws";
+import { ChatController } from "../controller.js";
+import { FRONTEND_HTML } from "./index.html.js";
+const WEB_HOST = "127.0.0.1";
+// ---------------------------------------------------------------------------
+// Auto-start — called by every bridge after MeshStore.init()
+// ---------------------------------------------------------------------------
+/**
+ * Start the web UI server on an OS-assigned port.
+ * Returns the server handle, or undefined if port discovery fails.
+ */
+export async function tryStartWebServer() {
+    return createWebServer();
+}
+/**
+ * Create and start the web server on a dynamic port.
+ * Used by tryStartWebServer (auto-start) and runWeb (standalone mode).
+ */
+export async function createWebServer(port = 0) {
+    const controller = new ChatController("Dashboard");
+    await controller.init();
+    const server = http.createServer((req, res) => {
+        handleRequest(req, res, controller);
+    });
+    const wss = new WebSocketServer({ server });
+    wss.on("connection", (ws) => {
+        handleWebSocket(ws, controller);
+    });
+    server.listen(port, WEB_HOST, () => {
+        const addr = server.address();
+        const actualPort = typeof addr === "object" && addr ? addr.port : port;
+        console.log(`Agent Comms web UI: http://${WEB_HOST}:${String(actualPort)}`);
+    });
+    return { server, controller, wss };
+}
+// ---------------------------------------------------------------------------
+// Standalone mode — `npx agent-comms chat`
+// ---------------------------------------------------------------------------
+export async function runWeb(userName, port = 0) {
+    const handle = await createWebServer(port);
+    handle.server.on("listening", () => {
+        const addr = handle.server.address();
+        const actualPort = typeof addr === "object" && addr ? addr.port : port;
+        console.log(`Agent Comms web UI: http://localhost:${String(actualPort)}`);
+        console.log(`Connected as ${userName} (user) [${handle.controller.agentId}]`);
+    });
+    // Graceful shutdown
+    const cleanup = async () => {
+        handle.wss.close();
+        handle.server.close();
+        await handle.controller.shutdown();
+        process.exit(0);
+    };
+    process.on("SIGINT", () => {
+        void cleanup();
+    });
+    process.on("SIGTERM", () => {
+        void cleanup();
+    });
+}
+// ---------------------------------------------------------------------------
+// HTTP handler
+// ---------------------------------------------------------------------------
+function handleRequest(req, res, controller) {
+    const url = new URL(req.url ?? "/", `http://localhost`);
+    // CORS
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
+    // Frontend
+    if (url.pathname === "/" && req.method === "GET") {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(FRONTEND_HTML);
+        return;
+    }
+    // API routes
+    if (url.pathname === "/api/agents" && req.method === "GET") {
+        void (async () => {
+            const agents = await controller.getAgents();
+            json(res, agents);
+        })();
+        return;
+    }
+    if (url.pathname === "/api/rooms" && req.method === "GET") {
+        void (async () => {
+            const rooms = await controller.getRooms();
+            json(res, rooms);
+        })();
+        return;
+    }
+    if (url.pathname.startsWith("/api/rooms/") &&
+        url.pathname.endsWith("/messages") &&
+        req.method === "GET") {
+        void (async () => {
+            const roomId = url.pathname.split("/")[3];
+            if (!roomId) {
+                jsonError(res, "Room ID required", 400);
+                return;
+            }
+            const since = url.searchParams.get("since") ?? undefined;
+            const messages = await controller.getRoomMessages(roomId, since);
+            json(res, messages);
+        })();
+        return;
+    }
+    if (url.pathname === "/api/action" && req.method === "POST") {
+        void (async () => {
+            const body = await readBody(req);
+            const parsed = JSON.parse(body);
+            if (typeof parsed !== "object" || parsed === null) {
+                jsonError(res, "Invalid JSON", 400);
+                return;
+            }
+            const params = Object.fromEntries(Object.entries(parsed));
+            const result = await executeAction(controller, params);
+            json(res, result);
+        })();
+        return;
+    }
+    res.writeHead(404);
+    res.end("Not found");
+}
+// ---------------------------------------------------------------------------
+// WebSocket handler
+// ---------------------------------------------------------------------------
+function handleWebSocket(ws, controller) {
+    // Push delivery events to this client
+    function onMessage(event) {
+        ws.send(JSON.stringify({ type: "delivery", event }));
+    }
+    controller.on("message", onMessage);
+    ws.on("close", () => {
+        controller.off("message", onMessage);
+    });
+    ws.on("message", (data) => {
+        void (async () => {
+            try {
+                const raw = typeof data === "string"
+                    ? data
+                    : new TextDecoder().decode(data instanceof ArrayBuffer
+                        ? data
+                        : Buffer.isBuffer(data)
+                            ? data
+                            : Buffer.concat(data));
+                const parsed = JSON.parse(raw);
+                if (typeof parsed !== "object" || parsed === null)
+                    throw new Error("Invalid JSON");
+                const params = Object.fromEntries(Object.entries(parsed));
+                const result = await executeAction(controller, params);
+                ws.send(JSON.stringify({ type: "result", result }));
+            }
+            catch (err) {
+                ws.send(JSON.stringify({
+                    type: "error",
+                    message: err instanceof Error ? err.message : String(err),
+                }));
+            }
+        })();
+    });
+    // Send initial state
+    void (async () => {
+        const agents = await controller.getAgents();
+        const rooms = await controller.getRooms();
+        ws.send(JSON.stringify({ type: "state", agents, rooms }));
+    })();
+}
+// ---------------------------------------------------------------------------
+// Action dispatcher
+// ---------------------------------------------------------------------------
+async function executeAction(controller, params) {
+    const action = params.action;
+    switch (action) {
+        case "send": {
+            const target = getString(params, "target");
+            const content = getString(params, "content");
+            if (!target || !content) {
+                return { content: "Missing target or content", isError: true };
+            }
+            return controller.send(target, content);
+        }
+        case "dm": {
+            const target = getString(params, "target");
+            const content = getString(params, "content");
+            if (!target || !content) {
+                return { content: "Missing target or content", isError: true };
+            }
+            return controller.dm(target, content);
+        }
+        case "join_room": {
+            const room = getString(params, "room");
+            if (!room)
+                return { content: "Missing room", isError: true };
+            const result = await controller.switchRoom(room);
+            if (!result.isError) {
+                const msgs = await controller.readRoom();
+                return {
+                    content: `${result.content}\n${msgs.content}`,
+                    isError: false,
+                };
+            }
+            return result;
+        }
+        case "leave_room": {
+            const room = getString(params, "room");
+            return controller.leaveRoom(room);
+        }
+        case "create_room": {
+            const name = getString(params, "name");
+            const type = getRoomType(params, "type") ?? "public";
+            const description = getString(params, "description") ?? "";
+            if (!name)
+                return { content: "Missing name", isError: true };
+            return controller.createRoom(name, type, description);
+        }
+        case "list_rooms":
+            return controller.listRooms();
+        case "list_agents":
+            return controller.listAgents();
+        case "read_room": {
+            const room = getString(params, "room");
+            return controller.readRoom(room);
+        }
+        case "destroy_room": {
+            const room = getString(params, "room");
+            if (!room)
+                return { content: "Missing room", isError: true };
+            return controller.destroyRoom(room);
+        }
+        case "invite": {
+            const room = getString(params, "room");
+            const agent = getString(params, "agent");
+            if (!room || !agent)
+                return { content: "Missing room or agent", isError: true };
+            return controller.invite(room, agent);
+        }
+        case "decline_invite": {
+            const room = getString(params, "room");
+            const reason = getString(params, "reason");
+            if (!room || !reason)
+                return { content: "Missing room or reason", isError: true };
+            return controller.declineInvite(room, reason);
+        }
+        case "kick": {
+            const room = getString(params, "room");
+            const agent = getString(params, "agent");
+            if (!room || !agent)
+                return { content: "Missing room or agent", isError: true };
+            return controller.kick(room, agent);
+        }
+        default:
+            return { content: `Unknown action: ${String(action)}`, isError: true };
+    }
+}
+// ---------------------------------------------------------------------------
+// Param extraction (no type assertions)
+// ---------------------------------------------------------------------------
+function getString(params, key) {
+    const value = params[key];
+    return typeof value === "string" ? value : undefined;
+}
+function getRoomType(params, key) {
+    const value = params[key];
+    if (value === "public" || value === "private" || value === "secret") {
+        return value;
+    }
+    return undefined;
+}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function json(res, data) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(data));
+}
+function jsonError(res, message, status) {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: message }));
+}
+function readBody(req) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        req.on("data", (chunk) => chunks.push(chunk));
+        req.on("end", () => {
+            resolve(Buffer.concat(chunks).toString());
+        });
+        req.on("error", reject);
+    });
+}
+//# sourceMappingURL=server.js.map

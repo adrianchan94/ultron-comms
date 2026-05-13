@@ -1,0 +1,210 @@
+/**
+ * Agent Comms — shared protocol types and Zod schemas.
+ *
+ * Every type is derived from its Zod schema (single source of truth).
+ * Use `Schema.parse(raw)` at JSON boundaries instead of `JSON.parse(raw) as T`.
+ * Use `Schema.is(value)` for type narrowing.
+ */
+import { z } from "zod";
+// ---------------------------------------------------------------------------
+// Schema-attached type guard helper
+// ---------------------------------------------------------------------------
+function defineSchema(schema) {
+    return Object.assign(schema, {
+        is(value) {
+            return schema.safeParse(value).success;
+        },
+    });
+}
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+export const Visibility = defineSchema(z.union([z.literal("visible"), z.literal("hidden"), z.literal("ghost")]));
+export const AgentStatus = defineSchema(z.union([
+    z.literal("active"),
+    z.literal("idle"),
+    z.literal("busy"),
+    z.literal("offline"),
+]));
+export const RoomType = defineSchema(z.union([z.literal("public"), z.literal("private"), z.literal("secret")]));
+// ---------------------------------------------------------------------------
+// AgentIdentity
+// ---------------------------------------------------------------------------
+export const AgentIdentitySchema = defineSchema(z.object({
+    id: z.string(),
+    name: z.string(),
+    harness: z.string(),
+    cwd: z.string(),
+    pid: z.number(),
+    startedAt: z.string(),
+    visibility: Visibility,
+    status: AgentStatus,
+    tags: z.array(z.string()),
+    subscribedRooms: z.array(z.string()),
+}));
+// ---------------------------------------------------------------------------
+// Room
+// ---------------------------------------------------------------------------
+export const RoomSchema = defineSchema(z.object({
+    id: z.string(),
+    name: z.string(),
+    type: RoomType,
+    owner: z.string(),
+    createdAt: z.string(),
+    description: z.string(),
+    members: z.array(z.string()),
+    invited: z.array(z.string()),
+}));
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+export const RoomMessageSchema = defineSchema(z.object({
+    id: z.string(),
+    from: z.string(),
+    room: z.string(),
+    content: z.string(),
+    timestamp: z.string(),
+    replyTo: z.string().optional(),
+    readBy: z.array(z.string()),
+}));
+export const DmMessageSchema = defineSchema(z.object({
+    id: z.string(),
+    from: z.string(),
+    to: z.string(),
+    content: z.string(),
+    timestamp: z.string(),
+    readBy: z.array(z.string()),
+}));
+export const DeliveryStatus = defineSchema(z.union([z.literal("delivered"), z.literal("read")]));
+// ---------------------------------------------------------------------------
+// Delivery events
+// ---------------------------------------------------------------------------
+export const RoomMemberSchema = defineSchema(z.object({
+    id: z.string(),
+    name: z.string(),
+    status: AgentStatus,
+}));
+export const DeliveryEventSchema = defineSchema(z.discriminatedUnion("type", [
+    z.object({
+        type: z.literal("room_message"),
+        message: RoomMessageSchema,
+    }),
+    z.object({
+        type: z.literal("dm"),
+        message: DmMessageSchema,
+    }),
+    z.object({
+        type: z.literal("room_invite"),
+        room: z.string(),
+        roomDescription: z.string(),
+        from: z.string(),
+        fromName: z.string(),
+        fromCwd: z.string(),
+    }),
+    z.object({
+        type: z.literal("member_joined"),
+        room: z.string(),
+        agent: z.string(),
+    }),
+    z.object({
+        type: z.literal("member_left"),
+        room: z.string(),
+        agent: z.string(),
+    }),
+    z.object({
+        type: z.literal("room_members"),
+        room: z.string(),
+        members: z.array(RoomMemberSchema),
+    }),
+    z.object({
+        type: z.literal("member_status"),
+        room: z.string(),
+        agent: z.string(),
+        status: AgentStatus,
+    }),
+    z.object({
+        type: z.literal("delivery_status"),
+        messageId: z.string(),
+        agent: z.string(),
+        status: DeliveryStatus,
+        room: z.string().optional(),
+    }),
+    z.object({
+        type: z.literal("invite_declined"),
+        room: z.string(),
+        agent: z.string(),
+        agentName: z.string(),
+        reason: z.string(),
+    }),
+]));
+// ---------------------------------------------------------------------------
+// CommsAction
+// ---------------------------------------------------------------------------
+export const CommsActionSchema = defineSchema(z.discriminatedUnion("action", [
+    z.object({
+        action: z.literal("register"),
+        name: z.string(),
+        visibility: Visibility,
+        tags: z.array(z.string()),
+    }),
+    z.object({
+        action: z.literal("update"),
+        visibility: Visibility.optional(),
+        status: AgentStatus.optional(),
+        name: z.string().optional(),
+        tags: z.array(z.string()).optional(),
+    }),
+    z.object({ action: z.literal("whoami") }),
+    z.object({
+        action: z.literal("create_room"),
+        name: z.string(),
+        type: RoomType,
+        description: z.string(),
+    }),
+    z.object({ action: z.literal("list_rooms") }),
+    z.object({
+        action: z.literal("join_room"),
+        room: z.string(),
+    }),
+    z.object({
+        action: z.literal("leave_room"),
+        room: z.string(),
+    }),
+    z.object({
+        action: z.literal("send"),
+        target: z.string(),
+        content: z.string(),
+        replyTo: z.string().optional(),
+    }),
+    z.object({
+        action: z.literal("dm"),
+        target: z.string(),
+        content: z.string(),
+    }),
+    z.object({ action: z.literal("list_agents") }),
+    z.object({
+        action: z.literal("read_room"),
+        room: z.string(),
+        since: z.string().optional(),
+    }),
+    z.object({
+        action: z.literal("invite"),
+        room: z.string(),
+        agent: z.string(),
+    }),
+    z.object({
+        action: z.literal("kick"),
+        room: z.string(),
+        agent: z.string(),
+    }),
+    z.object({
+        action: z.literal("decline_invite"),
+        room: z.string(),
+        reason: z.string(),
+    }),
+    z.object({
+        action: z.literal("destroy_room"),
+        room: z.string(),
+    }),
+]));
+//# sourceMappingURL=types.js.map

@@ -1,0 +1,250 @@
+/**
+ * Agent Comms — shared bridge helpers.
+ *
+ * Every bridge needs the same three things:
+ *   1. Parse tool parameters into a CommsAction (via Zod schema)
+ *   2. Format a DeliveryEvent as human-readable text
+ *   3. Register (or recover) an agent identity
+ *
+ * Extracted here so each bridge only wires up its harness-specific
+ * push mechanism and tool registration.
+ */
+import { z } from "zod";
+// ---------------------------------------------------------------------------
+// Tool parameter schema — single source of truth for MCP input
+// ---------------------------------------------------------------------------
+const VisibilityEnum = z.enum(["visible", "hidden", "ghost"]);
+const StatusEnum = z.enum(["active", "idle", "busy"]);
+const RoomTypeEnum = z.enum(["public", "private", "secret"]);
+export const MCP_TOOL_PARAMS = z.object({
+    action: z.enum([
+        "register",
+        "update",
+        "whoami",
+        "create_room",
+        "list_rooms",
+        "join_room",
+        "leave_room",
+        "send",
+        "dm",
+        "list_agents",
+        "read_room",
+        "invite",
+        "decline_invite",
+        "kick",
+        "destroy_room",
+    ]),
+    name: z.string().optional(),
+    visibility: VisibilityEnum.optional(),
+    tags: z.array(z.string()).optional(),
+    status: StatusEnum.optional(),
+    room: z.string().optional(),
+    type: RoomTypeEnum.optional(),
+    description: z.string().optional(),
+    target: z.string().optional(),
+    content: z.string().optional(),
+    agent: z.string().optional(),
+    since: z.string().optional(),
+    replyTo: z.string().optional(),
+    reason: z.string().optional(),
+});
+/**
+ * Zod schema for the MCP tool inputSchema field.
+ * This is the same schema exposed directly for the MCP SDK.
+ */
+// Removed MCP_TOOL_SCHEMA alias — use MCP_TOOL_PARAMS directly
+// ---------------------------------------------------------------------------
+// buildAction — parsed params → typed CommsAction
+// ---------------------------------------------------------------------------
+class BuildActionError extends Error {
+    action;
+    constructor(action, field) {
+        super(`Missing required field "${field}" for action "${action}"`);
+        this.action = action;
+        this.name = "BuildActionError";
+    }
+}
+export function buildAction(params) {
+    const parsed = MCP_TOOL_PARAMS.safeParse(params);
+    if (!parsed.success)
+        return { action: "whoami" };
+    const p = parsed.data;
+    switch (p.action) {
+        case "register":
+            if (p.name === undefined)
+                throw new BuildActionError("register", "name");
+            return {
+                action: "register",
+                name: p.name,
+                visibility: p.visibility ?? "visible",
+                tags: p.tags ?? [],
+            };
+        case "update": {
+            const update = { action: "update" };
+            if (p.visibility !== undefined)
+                update.visibility = p.visibility;
+            if (p.status !== undefined)
+                update.status = p.status;
+            if (p.name !== undefined)
+                update.name = p.name;
+            if (p.tags !== undefined)
+                update.tags = p.tags;
+            return update;
+        }
+        case "whoami":
+            return { action: "whoami" };
+        case "create_room":
+            if (p.room === undefined)
+                throw new BuildActionError("create_room", "room");
+            return {
+                action: "create_room",
+                name: p.room,
+                type: p.type ?? "public",
+                description: p.description ?? "",
+            };
+        case "list_rooms":
+            return { action: "list_rooms" };
+        case "join_room":
+            if (p.room === undefined)
+                throw new BuildActionError("join_room", "room");
+            return { action: "join_room", room: p.room };
+        case "leave_room":
+            if (p.room === undefined)
+                throw new BuildActionError("leave_room", "room");
+            return { action: "leave_room", room: p.room };
+        case "send": {
+            if (p.content === undefined)
+                throw new BuildActionError("send", "content");
+            if (p.target !== undefined) {
+                const send = {
+                    action: "send",
+                    target: p.target,
+                    content: p.content,
+                };
+                if (p.replyTo !== undefined)
+                    send.replyTo = p.replyTo;
+                return send;
+            }
+            if (p.room !== undefined) {
+                const send = {
+                    action: "send",
+                    target: p.room,
+                    content: p.content,
+                };
+                if (p.replyTo !== undefined)
+                    send.replyTo = p.replyTo;
+                return send;
+            }
+            throw new BuildActionError("send", "target");
+        }
+        case "dm": {
+            if (p.content === undefined)
+                throw new BuildActionError("dm", "content");
+            if (p.target !== undefined) {
+                return { action: "dm", target: p.target, content: p.content };
+            }
+            if (p.agent !== undefined) {
+                return { action: "dm", target: p.agent, content: p.content };
+            }
+            throw new BuildActionError("dm", "target");
+        }
+        case "list_agents":
+            return { action: "list_agents" };
+        case "read_room":
+            if (p.room === undefined)
+                throw new BuildActionError("read_room", "room");
+            return {
+                action: "read_room",
+                room: p.room,
+                ...(p.since !== undefined && { since: p.since }),
+            };
+        case "invite":
+            if (p.room === undefined)
+                throw new BuildActionError("invite", "room");
+            if (p.agent === undefined)
+                throw new BuildActionError("invite", "agent");
+            return { action: "invite", room: p.room, agent: p.agent };
+        case "decline_invite":
+            if (p.room === undefined)
+                throw new BuildActionError("decline_invite", "room");
+            if (p.reason === undefined)
+                throw new BuildActionError("decline_invite", "reason");
+            return { action: "decline_invite", room: p.room, reason: p.reason };
+        case "kick":
+            if (p.room === undefined)
+                throw new BuildActionError("kick", "room");
+            if (p.agent === undefined)
+                throw new BuildActionError("kick", "agent");
+            return { action: "kick", room: p.room, agent: p.agent };
+        case "destroy_room":
+            if (p.room === undefined)
+                throw new BuildActionError("destroy_room", "room");
+            return { action: "destroy_room", room: p.room };
+    }
+}
+// ---------------------------------------------------------------------------
+// formatDeliveryEvent — DeliveryEvent → human-readable string
+// ---------------------------------------------------------------------------
+export function formatDeliveryEvent(event) {
+    switch (event.type) {
+        case "room_message":
+            return `[${event.message.room}] ${event.message.from}: ${event.message.content}`;
+        case "dm":
+            return `DM from ${event.message.from}: ${event.message.content}`;
+        case "room_invite": {
+            const desc = event.roomDescription ? ` — ${event.roomDescription}` : "";
+            const who = event.fromCwd
+                ? `${event.fromName} (${event.fromCwd})`
+                : event.fromName;
+            return `${who} invited you to room "${event.room}"${desc}`;
+        }
+        case "member_joined":
+            return `${event.agent} joined ${event.room}`;
+        case "member_left":
+            return `${event.agent} left ${event.room}`;
+        case "room_members": {
+            const names = event.members
+                .map((m) => `${m.name} (${m.status})`)
+                .join(", ");
+            return `Room ${event.room} members: ${names}`;
+        }
+        case "member_status":
+            return `${event.agent} is now ${event.status} in ${event.room}`;
+        case "delivery_status":
+            return `Message ${event.messageId} ${event.status} by ${event.agent}${event.room ? ` in ${event.room}` : ""}`;
+        case "invite_declined":
+            return `${event.agentName} declined invite to ${event.room}: "${event.reason}"`;
+    }
+}
+/**
+ * Recover an existing identity (from `identity.json`) or register a new agent.
+ * Returns the agent ID and whether this was a fresh registration.
+ */
+export async function ensureRegistered(opts) {
+    await opts.store.init();
+    const identity = await opts.store.readIdentity(opts.harness, opts.cwd);
+    if (identity) {
+        await opts.store.updateAgent(identity.id, {
+            status: "active",
+            pid: process.pid,
+        });
+        return { agentId: identity.id, store: opts.store, isNew: false };
+    }
+    const agent = await opts.store.registerAgent({
+        name: opts.defaultName,
+        harness: opts.harness,
+        cwd: opts.cwd,
+        pid: process.pid,
+        visibility: opts.visibility ?? "visible",
+        tags: opts.tags ?? [],
+    });
+    return { agentId: agent.id, store: opts.store, isNew: true };
+}
+// ---------------------------------------------------------------------------
+// drainAndFormat — drain delivery queue, return formatted lines
+// ---------------------------------------------------------------------------
+export async function drainAndFormat(store, agentId) {
+    const events = await store.drainDelivery(agentId);
+    return events.map(formatDeliveryEvent);
+}
+//# sourceMappingURL=bridge.js.map

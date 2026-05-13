@@ -1,0 +1,19 @@
+/**
+ * Minimal nanoid — URL-safe alphanumeric, no dependencies.
+ * Uses crypto.getRandomValues for cryptographic randomness.
+ */
+const ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
+const SIZE = 21;
+export function nanoid(size = SIZE) {
+    const bytes = new Uint8Array(size);
+    crypto.getRandomValues(bytes);
+    let id = "";
+    for (let i = 0; i < size; i++) {
+        const byte = bytes[i];
+        if (byte === undefined)
+            continue;
+        id += ALPHABET.charAt(byte % ALPHABET.length);
+    }
+    return id;
+}
+//# sourceMappingURL=nanoid.js.map
