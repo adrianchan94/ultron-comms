@@ -181,7 +181,20 @@ export function createWireConnection(
   onConnect: () => void,
 ): Wire {
   if (TRANSPORT === "ws") {
-    const ws = new WebSocket(`ws://${opts.host}:${opts.port}`);
+    // TLS detection: port 443 or explicit env opt-in => wss://, else ws://.
+    // Northflank, Cloudflare, etc. all front public services on 443 with
+    // automatic TLS termination, so wss:// is the canonical cloud case.
+    const useTls =
+      opts.port === 443 ||
+      process.env.ULTRON_COMMS_TLS === "1" ||
+      process.env.ULTRON_COMMS_TLS === "true";
+    const scheme = useTls ? "wss" : "ws";
+    // When the public host is fronted at 443 we omit the port (wss://host)
+    // so SNI / virtual hosting works correctly with the NF load balancer.
+    const url = useTls && opts.port === 443
+      ? `${scheme}://${opts.host}`
+      : `${scheme}://${opts.host}:${opts.port}`;
+    const ws = new WebSocket(url);
     const wire = new WsWire(ws);
     ws.on("open", () => onConnect());
     return wire;
