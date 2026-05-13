@@ -268,7 +268,9 @@ export class MeshStore {
         socket.on("data", (data) => {
             const items = buffer.append(data.toString());
             for (const item of items) {
-                if (isMeshMessage(item) && item.method === "introduce") {
+                if (!isMeshMessage(item))
+                    continue;
+                if (item.method === "introduce") {
                     if (!authValid(item.authToken)) {
                         // eslint-disable-next-line no-console
                         console.warn(`[ultron-comms] auth_rejected peer=${item.peerId ?? "?"} from coordinator handshake`);
@@ -283,6 +285,26 @@ export class MeshStore {
                         return;
                     }
                     void this.handleIntroduction(socket, item);
+                }
+                else if (item.method === "state_update" || item.method === "state_sync") {
+                    // Cloud-coord relay (server side): client pushed state to us.
+                    // Apply locally so subsequent introductions see fresh state,
+                    // and rebroadcast to every other coord client so they
+                    // hydrate too. handleDataMessage runs the same merge logic
+                    // the data-port path uses; broadcastToDataConnections fans
+                    // out to peerConnections AND coordinatorServerSockets.
+                    void this.handleDataMessage(item).then(() => {
+                        // Forward to other coord clients (skip the originator).
+                        const payload = encode(item);
+                        for (const other of this.coordinatorServerSockets) {
+                            if (other === socket)
+                                continue;
+                            try {
+                                other.write(payload);
+                            }
+                            catch { /* drop */ }
+                        }
+                    });
                 }
             }
         });
@@ -519,7 +541,20 @@ export class MeshStore {
         await Promise.all(writes);
     }
     async broadcastPatch(patch) {
-        await this.broadcastToDataConnections({ method: "state_update", patch });
+        const msg = { method: "state_update", patch };
+        await this.broadcastToDataConnections(msg);
+        // Cloud-coord relay (client side): also push upstream over our
+        // coord socket so the coordinator can re-broadcast to all other
+        // clients. In local-mesh mode the data-port path already covers
+        // everyone, so this is a duplicate but cheap. In cloud-coord mode
+        // it's the only path that works at all because direct peer-to-peer
+        // data ports aren't routable through the TLS edge.
+        if (this.coordinatorSocket) {
+            try {
+                await writeAsync(this.coordinatorSocket, encode(msg));
+            }
+            catch { /* drop */ }
+        }
     }
     async deliverLocallyAndBroadcast(agentId, event) {
         // Local delivery
