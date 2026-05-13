@@ -309,6 +309,12 @@ export class MeshStore implements CommsStore {
     } else if (msg.method === "peer_joined") {
       this.peerInfo.set(msg.peer.id, msg.peer);
       void this.connectToPeerData(msg.peer);
+    } else if (msg.method === "state_sync" || msg.method === "state_update") {
+      // Cloud-coord relay: coordinator pushed state over our coord socket
+      // because direct peer-to-peer data sync isn't routable here. Reuse
+      // the same merge logic the data-port path uses so semantics match
+      // exactly across local-mesh and cloud-coord deployments.
+      void this.handleDataMessage(msg);
     }
   }
 
@@ -390,6 +396,23 @@ export class MeshStore implements CommsStore {
       peers: [...this.peerInfo.values()],
     };
     await writeAsync(socket, encode(peerList));
+
+    // Cloud-coord relay: in private-network meshes peers can dial each
+    // other directly and exchange state over the data port (see
+    // becomeCoordinator). In cloud-coord mode that path is blocked because
+    // peer dataPorts aren't routable from the TLS edge, so the coord must
+    // also push the current state over the coordinator socket. Mirroring
+    // the same payload onto every coordinator client keeps both paths in
+    // sync without changing the local-mesh fast path.
+    if (this.agents.size > 0 || this.rooms.size > 0) {
+      const state: SerialisedState = {
+        agents: Object.fromEntries(this.agents),
+        rooms: Object.fromEntries(this.rooms),
+        messages: Object.fromEntries(this.messages),
+        dms: Object.fromEntries(this.dms),
+      };
+      try { await writeAsync(socket, encode({ method: "state_sync", state })); } catch { /* drop */ }
+    }
 
     // Broadcast arrival to all existing data connections
     const joined: MeshMessage = { method: "peer_joined", peer: newPeer };
@@ -587,6 +610,19 @@ export class MeshStore implements CommsStore {
       writes.push(
         writeAsync(peer.socket, data).catch(() => {
           /* broken connection — cleanup handled by close/error listeners */
+        }),
+      );
+    }
+    // Cloud-coord relay: when peers can't dial each other directly (e.g.
+    // because they're behind NAT or the coord lives on a TLS edge), the
+    // peer-to-peer data fabric collapses to a single broadcast channel
+    // through the coord. Mirror every patch onto every client connected to
+    // OUR coordinator port so they see state mutations even without a direct
+    // data connection.
+    for (const sock of this.coordinatorServerSockets) {
+      writes.push(
+        writeAsync(sock, data).catch(() => {
+          /* drop — cleanup on close */
         }),
       );
     }

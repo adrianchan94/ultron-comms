@@ -83,9 +83,12 @@ class WsServerAdapter {
         this.wss.on("connection", (ws) => {
             onConnection(new WsWire(ws));
         });
-        // Forward wss-level errors (e.g. handshake faults) to the http server so
-        // one .on("error", ...) on the adapter catches both.
-        this.wss.on("error", (err) => this.httpServer.emit("error", err));
+        // Note: we intentionally do NOT re-emit wss errors onto httpServer.
+        // ws.Server's WebSocketServer attaches itself to the http server and
+        // already proxies httpServer errors to its own listeners, so any extra
+        // wiring here causes an infinite emit loop (max-call-stack). Adapter
+        // consumers wire one .on("error", ...) onto the http server (below);
+        // any wss-level error will surface through that path on its own.
     }
     listen(port, host, cb) {
         this.httpServer.listen(port, host, cb);
@@ -94,7 +97,10 @@ class WsServerAdapter {
         return this.httpServer.address();
     }
     on(event, listener) {
+        // Attach to BOTH so handshake-time errors (wss) and listen-time errors
+        // (httpServer) reach the same callback without an emit loop.
         this.httpServer.on(event, listener);
+        this.wss.on(event, listener);
         return this;
     }
     close(cb) {
